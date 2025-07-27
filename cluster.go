@@ -18,9 +18,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/gocql/gocql"
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 )
-
 
 const apacheAuthenticator = "org.apache.cassandra.auth.PasswordAuthenticator"
 const dseAuthenticator = "com.datastax.bdp.cassandra.auth.DseAuthenticator"
@@ -43,22 +42,43 @@ func NewClusterFromURL(url, databaseID, token string, timeout time.Duration) (*g
 }
 
 func NewCluster(dialer gocql.HostDialer, username, password string) *gocql.ClusterConfig {
-	// add multiple fake contact points to make gocql call the dialer multiple times (since the dialer will cycle through the contact points
-	cluster := gocql.NewCluster("0.0.0.1", "0.0.0.2", "0.0.0.3") // Placeholder, maybe figure how to make this better
+	// Add multiple fake contact points to make gocql call the dialer multiple times
+	// The actual connection will be handled by the dialer, so these are just placeholders
+	cluster := gocql.NewCluster("0.0.0.1", "0.0.0.2", "0.0.0.3")
+	
+	// Set the custom dialer that will handle the actual connection to Astra DB
 	cluster.HostDialer = dialer
 
-	// this will make gocql ignore the contact point address for the control host initially and use the system.local address right away
-	// while also preventing a panic in `ConnectAddress()` if the control connection fails to initialize
+	// Keep the original IP addresses during translation
 	cluster.AddressTranslator = gocql.AddressTranslatorFunc(func(addr net.IP, port int) (net.IP, int) {
-		return net.IPv4zero, port
+		return addr, port
 	})
 
+	// Configure connection pool with round-robin policy
 	cluster.PoolConfig = gocql.PoolConfig{HostSelectionPolicy: gocql.RoundRobinHostPolicy()}
+	
+	// Set up authentication with multiple allowed authenticators
 	cluster.Authenticator = &gocql.PasswordAuthenticator{
-		Username: username,
-		Password: password,
+		Username:              username,
+		Password:              password,
 		AllowedAuthenticators: []string{apacheAuthenticator, dseAuthenticator, astraAuthenticator},
 	}
+	
+	// Explicitly set protocol version to avoid negotiation issues
+	cluster.ProtoVersion = 4
+	
+	// Disable initial host lookup as we're using a custom dialer
+	cluster.DisableInitialHostLookup = true
+	
+	// Set a reasonable reconnect interval
 	cluster.ReconnectInterval = 30 * time.Second
+	
+	// Increase timeouts to handle potential network latency with Astra
+	cluster.Timeout = 30 * time.Second
+	cluster.ConnectTimeout = 30 * time.Second
+	
+	// Retry policy for better resilience
+	cluster.RetryPolicy = &gocql.SimpleRetryPolicy{NumRetries: 5}
+	
 	return cluster
 }

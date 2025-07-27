@@ -30,8 +30,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	gocql "github.com/apache/cassandra-gocql-driver/v2"
 	"github.com/datastax/cql-proxy/astra"
-	"github.com/gocql/gocql"
 )
 
 const AstraAPIURL = "https://api.astra.datastax.com"
@@ -81,6 +81,11 @@ func (d *dialer) DialHost(ctx context.Context, host *gocql.HostInfo) (*gocql.Dia
 		return nil, err
 	}
 
+	// If we have no contact points, this is a critical error
+	if len(contactPoints) == 0 {
+		return nil, fmt.Errorf("no contact points available from Astra metadata")
+	}
+
 	addr, err := lookupHost(sniAddr)
 	if err != nil {
 		return nil, err
@@ -93,10 +98,14 @@ func (d *dialer) DialHost(ctx context.Context, host *gocql.HostInfo) (*gocql.Dia
 
 	hostId := host.HostID()
 	if hostId == "" {
-		hostId = contactPoints[int(atomic.AddInt32(&d.contactPointIndex, 1))%len(d.contactPoints)]
+		// Use modulo to cycle through available contact points
+		index := int(atomic.AddInt32(&d.contactPointIndex, 1)) % len(contactPoints)
+		hostId = contactPoints[index]
 	}
 
-	tlsConn := tls.Client(conn, copyTLSConfig(d.bundle, hostId))
+	// Create a TLS config with the appropriate server name
+	tlsConfig := copyTLSConfig(d.bundle, hostId)
+	tlsConn := tls.Client(conn, tlsConfig)
 	if err = tlsConn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("error connecting to Astra node %v through ingress %v: %w", hostId, addr, err)
@@ -161,9 +170,15 @@ func (d *dialer) resolveMetadata(ctx context.Context) (string, []string, error) 
 
 func copyTLSConfig(bundle *astra.Bundle, serverName string) *tls.Config {
 	tlsConfig := bundle.TLSConfig.Clone()
+	// Set the ServerName to the SNI proxy name for proper TLS handshake
 	tlsConfig.ServerName = serverName
+	
+	// We need to skip verification initially but verify manually
 	tlsConfig.InsecureSkipVerify = true
+	
+	// Custom certificate verification function
 	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		// Parse all certificates
 		certs := make([]*x509.Certificate, len(rawCerts))
 		for i, asn1Data := range rawCerts {
 			cert, err := x509.ParseCertificate(asn1Data)
@@ -172,16 +187,27 @@ func copyTLSConfig(bundle *astra.Bundle, serverName string) *tls.Config {
 			}
 			certs[i] = cert
 		}
+		
+		// If no certificates were presented, that's an error
+		if len(certs) == 0 {
+			return errors.New("tls: no certificates presented by server")
+		}
 
+		// Set up verification options
 		opts := x509.VerifyOptions{
 			Roots:         tlsConfig.RootCAs,
 			CurrentTime:   time.Now(),
+			// Use the bundle host for verification
 			DNSName:       bundle.Host,
 			Intermediates: x509.NewCertPool(),
 		}
+		
+		// Add any intermediate certificates to the pool
 		for _, cert := range certs[1:] {
 			opts.Intermediates.AddCert(cert)
 		}
+		
+		// Verify the leaf certificate
 		var err error
 		verifiedChains, err = certs[0].Verify(opts)
 		return err
@@ -211,9 +237,11 @@ func lookupHost(hostWithPort string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Try to lookup the host, but if it fails, just use the host as is
 	addrs, err := net.LookupHost(host)
-	if err != nil {
-		return "", err
+	if err != nil || len(addrs) == 0 {
+		// If lookup fails, just use the original host
+		return hostWithPort, nil
 	}
 	addr := addrs[rand.Intn(len(addrs))]
 	if len(port) > 0 {
